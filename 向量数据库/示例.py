@@ -106,37 +106,60 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 # ─────────────────────────────────────────────
-# 1. 索引层抽象:FlatIndex(暴力) / IVFIndex(倒排聚类加速)
+# 1. 索引层:FlatIndex(暴力 100% 召回) / IVFIndex(倒排聚类加速)
 # ─────────────────────────────────────────────
-# 这是向量数据库内部「加速近邻检索」的核心部分。
-# 真实产品有 HNSW/DiskANN/PQ 等,这里用最容易实现的 IVF 演示原理。
+#
+# 【索引层到底是干嘛的】⭐
+# 数据只有几十条时,查询一条条比没问题(O(N))。
+# 但到 100 万条 × 1024 维时,每次查询要算 10 亿次乘法 → 慢到离谱。
+# 索引层的作用就是:以"丢失一点点召回率"为代价,把复杂度从 O(N) 降到 O(log N)。
+#
+# 通俗类比:
+#   Flat 暴力索引 = 想找一本书,把图书馆 1 万本书从头到尾翻一遍
+#   IVF 聚类索引 = 先把书按主题分到 100 个书架(K-Means聚类),想找书先去最近的3个书架找
+#   HNSW 分层图   = 图书馆每层楼都标了"这层是啥",你 3 楼→2 楼→1 楼跳着找(最快)
+#
+# 真实向量数据库(FAISS/Milvus/Qdrant)默认基本都用 HNSW,但 HNSW 图手搓太复杂,
+# 这里用 IVF(原理最容易讲清楚)来演示「索引怎么加速」。
 
 class FlatIndex:
     """
-    Flat 暴力索引:对所有向量逐个比。
-    对标 FAISS:IndexFlatL2 / IndexFlatIP
-    数据量 ≤ 1 万时 100% 召回,速度也够用。
+    【Flat 暴力索引】
+    不做任何加速,把库里所有向量和查询向量挨个比相似度,排序取前 K。
+    好处是 100% 不会漏(召回率 100%),坏处是慢。
+
+    对标真实产品:FAISS IndexFlatIP / Chroma 小数据量默认行为
+    适用场景:≤1 万条数据,或做「标准答案池」测其他索引召回率时用。
     """
 
     def __init__(self, dim: int):
-        self.dim = dim
-        self.vectors: list[list[float]] = []  # 所有向量
+        self.dim = dim                          # 维度
+        self.vectors: list[list[float]] = []    # 所有向量直接放在一个大列表里
 
     def add(self, vectors: list[list[float]]) -> None:
+        """把一批向量写进索引,维度不对会立即报错防止污染"""
         for v in vectors:
             assert len(v) == self.dim, f"维度不匹配,期望 {self.dim},实际 {len(v)}"
         self.vectors.extend(vectors)
 
     def search(self, q_vec: list[float], k: int) -> tuple[list[int], list[float]]:
         """
-        返回 (top_k 的位置下标列表, 对应 score 列表),均按 score 从大到小排序。
+        暴力 Top-K 查询。
+        返回值:
+          ([row_1, row_2, ..., row_k],  ← 相似向量在 self.vectors 里的位置下标
+           [sco_1, sco_2, ..., sco_k]) ← 对应的相似度(从大到小排好)
         """
+        # 枚举每条向量,记录 (位置下标, 相似度)
         scored = [(i, cosine(q_vec, self.vectors[i])) for i in range(len(self.vectors))]
+        # 按相似度从大到小排序
         scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[:k]
+        top = scored[:k]  # 取前 K 个
+        # 把 [(idx, sco), ...] 拆成 两个平行列表
         return [x[0] for x in top], [round(x[1], 4) for x in top]
 
-    # ---- 序列化(为了 save_local) ----
+    # ---- state_dict / from_state:序列化 → 给 save_local 存磁盘用 ----
+    # 把对象里的字段打包成可 JSON 化的 dict,反过来从 dict 恢复对象
+    # JS 类比: { ...obj } ↔ Object.assign(new X(), state)
     def state_dict(self) -> dict:
         return {"type": "flat", "dim": self.dim, "vectors": self.vectors}
 
@@ -149,95 +172,119 @@ class FlatIndex:
 
 class IVFIndex:
     """
-    IVF 倒排索引(Inverted File Index):
-    建库阶段:
-        1. 对所有向量做 K-Means 聚类,得到 nlist 个「聚类中心(centroid)」
-        2. 每条向量归到最近的 1 个聚类桶里(倒排)
-    查询阶段:
-        1. 先找 q_vec 最近的 nprobe 个聚类中心
-        2. 只在这 nprobe 个桶里做暴力
-        3. 取 Top-K
+    【IVF 倒排索引:Inverted File Index】⭐ 这是本文件最复杂的一段
+    思路 = 「垃圾分类加速查找」:
+      建库时用 K-Means 把所有向量分成 nlist 个「桶」(就像把 10000 本书分到 100 个主题书架)
+      查询时只在最近的 nprobe 个桶里做暴力(找书先去 3 个最相关的书架找,不是全图书馆)
 
-    对标 FAISS:IndexIVFFlat
-    典型参数:nlist = sqrt(N) 左右;  nprobe = 10~50 (越大越慢,召回越高)
+    代价:万一有本书分错桶,或者查询向量刚好靠在两个桶边界,可能漏掉正确结果(召回率 96~99%)。
+        调大 nprobe(多扫几个桶),召回率就升,速度就降,nprobe 是「速度↔召回」的旋钮。
+
+    对标产品:FAISS IndexIVFFlat
+    典型经验值: nlist ≈ sqrt(N) (sqrt(100 万)=1000),  nprobe = 10~50
     """
 
     def __init__(self, dim: int, nlist: int = 16, nprobe: int = 4, seed: int = 7):
         self.dim = dim
-        self.nlist = nlist         # 聚类中心数 = 桶数
-        self.nprobe = nprobe       # 查询时扫多少个桶
-        self.seed = seed
-        self.centroids: list[list[float]] = []   # 聚类中心 (nlist, dim)
-        self.buckets: list[list[int]] = []       # buckets[cid] = 该桶里的 row id 列表
+        self.nlist = nlist                    # 聚类中心数 = 「书架数」
+        self.nprobe = nprobe                  # 查询时扫几个书架
+        self.seed = seed                      # K-Means 初始化随机种子(保证可复现)
+        self.centroids: list[list[float]] = []   # 每个书架的"代表向量"(聚类中心)
+        self.buckets: list[list[int]] = []       # 每个书架里的书(row 编号列表)
 
-    # ── 建库:K-Means 聚类 + 建倒排桶 ──
+    # ── 建库阶段:K-Means 聚类算法,把所有向量分桶 ──
     def add(self, vectors: list[list[float]], max_iter: int = 20) -> None:
+        """
+        把 vectors 做 K-Means 聚类:
+          ① 初始化 nlist 个中心(随机挑 nlist 条向量当书架代表)
+          ② 迭代 E 步(每条选最近的中心) + M 步(重新计算每个书架的新代表)
+          ③ 直到没人换书架(收敛)或超 max_iter 轮
+
+        通俗类比(给 10 个球分 3 个桶):
+          先随便挑 3 个球当"代表"
+          循环:(把每个球放到离它最近的代表那桶) → (每桶中心重新计算为桶里球的平均位置)
+          直到连续一轮没人换桶,结束。
+        """
         N = len(vectors)
-        self.nlist = min(self.nlist, N)   # 桶数不能超点数
+        self.nlist = min(self.nlist, N)   # 点数比桶数少,就缩桶数
         rng = random.Random(self.seed)
 
-        # 1) 初始化中心:随机挑 nlist 条向量
-        picks = rng.sample(range(N), self.nlist)
-        self.centroids = [list(vectors[i]) for i in picks]
+        # 1) 初始化 nlist 个聚类中心:从向量里随机挑 nlist 条作为"初始书架代表"
+        picks = rng.sample(range(N), self.nlist)           # 随机抽 nlist 个不同下标
+        self.centroids = [list(vectors[i]) for i in picks]  # 深拷贝(怕原数据被改)
 
-        assign = [0] * N          # assign[row] = 这条归到哪个桶
+        # assign[row] = 这条向量现在被分到第几桶(长度 N 的数组)
+        assign = [0] * N
+
+        # 2) 迭代最多 max_iter 次 K-Means: E步(分配) → M步(更新中心)
         for it in range(max_iter):
-            # 2a) E 步:每条向量找最近的中心
+            # ─────────────────── E 步:每条向量找最近的中心(给它分桶) ───────────────────
             changed = False
             for i in range(N):
                 best_c, best_s = 0, -1.0
                 for c in range(self.nlist):
+                    # 这条向量 跟 第 c 个中心 比相似度
                     s = cosine(vectors[i], self.centroids[c])
                     if s > best_s:
                         best_s = s
                         best_c = c
-                if assign[i] != best_c:
+                if assign[i] != best_c:    # 如果桶号变了,记一下这轮有变化
                     assign[i] = best_c
                     changed = True
-            # 2b) M 步:每个桶内的向量求均值,更新为新中心
+
+            # ─────────────────── M 步:每个桶重新选代表(桶里向量取均值) ───────────────────
             for c in range(self.nlist):
-                mems = [i for i in range(N) if assign[i] == c]
+                mems = [i for i in range(N) if assign[i] == c]   # 这桶里有哪些成员
                 if not mems:
-                    # 空桶:重新随机给一个向量
+                    # 空桶(没人选这个中心):随机塞一条向量当代表,避免中心位置消失
                     self.centroids[c] = list(vectors[rng.randrange(N)])
                     continue
+                # 新中心 = 所有成员向量按维求平均
                 new_c = [0.0] * self.dim
                 for mi in mems:
                     for d in range(self.dim):
                         new_c[d] += vectors[mi][d]
                 for d in range(self.dim):
                     new_c[d] /= len(mems)
-                # 重新归一化(向量空间是单位球面)
+                # 求完均值再做一次 L2 归一化(向量在单位球面上,均值点不一定在单位球面上)
                 norm = math.sqrt(sum(v * v for v in new_c)) or 1e-9
                 self.centroids[c] = [v / norm for v in new_c]
+
+            # 这一轮没人换桶 → 收敛了,不用继续迭代
             if not changed:
                 break
 
-        # 3) 最终生成倒排桶
+        # 3) 收敛完成:最终生成倒排桶(每个桶里有哪些 row 编号,方便查的时候直接拿)
         self.buckets = [[] for _ in range(self.nlist)]
         for i in range(N):
             self.buckets[assign[i]].append(i)
 
-    # ── 查询:先找 nprobe 个最近桶 → 只在这些桶里暴力 ──
+    # ── 查询阶段:找 nprobe 个最近桶 → 只在这些桶里暴力 ──
     def search(self, q_vec: list[float], k: int) -> tuple[list[int], list[float]]:
-        # 1) 给 q_vec 找最近的 nprobe 个中心
+        """
+        3 步加速查询(比 Flat 省了「1 - nprobe/nlist」的计算量):
+          ① 给查询向量找最近的 nprobe 个书架(聚类中心)
+          ② 把这些书架里所有 row 编号合并去重 → 候选项(少了 10 倍~100 倍)
+          ③ 只对候选项做暴力比相似度,排 Top-K
+        """
+        # 1) q_vec 和每个书架代表比相似度,取最近的 nprobe 个书架编号
         c_scores = [(c, cosine(q_vec, self.centroids[c])) for c in range(self.nlist)]
         c_scores.sort(key=lambda x: x[1], reverse=True)
         probe_cids = [x[0] for x in c_scores[: self.nprobe]]
 
-        # 2) 把这些桶里的 row id 全部收集起来(去重)
+        # 2) 把这几个书架里的所有书(row号)合并成候选集(set自动去重)
         cand_rows = set()
         for cid in probe_cids:
             for rid in self.buckets[cid]:
                 cand_rows.add(rid)
 
-        # 3) 在候选集里暴力比相似度,取 Top-K
+        # 3) 只在候选集里做暴力,取 Top-K(用 _GLOBAL_VECTORS 拿到全局原始向量)
         scored = [(r, cosine(q_vec, _GLOBAL_VECTORS[r])) for r in cand_rows]
         scored.sort(key=lambda x: x[1], reverse=True)
         top = scored[:k]
         return [x[0] for x in top], [round(x[1], 4) for x in top]
 
-    # ── 序列化 ──
+    # ── 序列化:存 centroids 和 buckets(vectors 已经在 ToyVectorDB 里存一份,不重复存) ──
     def state_dict(self) -> dict:
         return {
             "type": "ivf",
@@ -256,8 +303,10 @@ class IVFIndex:
         return idx
 
 
-# 这是一个全局小技巧:IVFIndex.search 需要引用所有向量做相似度
-# 实际 FAISS 是在 C 内部共享,Python 手搓版我们用一个模块级变量传进去。
+# 这是一个全局共享小技巧:
+# IVFIndex.search 里要拿到"完整的向量大数组"才能算 cosine。
+# 真实 FAISS 在 C 内部就共享了数据,Python 手搓版我们用一个模块级变量传进去。
+# ToyVectorDB.build_index 时会把 self.vectors 赋给这个变量。
 _GLOBAL_VECTORS: list[list[float]] = []
 
 
