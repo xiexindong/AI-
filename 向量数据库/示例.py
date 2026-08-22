@@ -311,57 +311,88 @@ _GLOBAL_VECTORS: list[list[float]] = []
 
 
 # ─────────────────────────────────────────────
-# 2. ToyVectorDB:数据库层(数据层 + 索引层 + 服务层三合一)
+# 2. ToyVectorDB:数据层 + 索引层 + 服务层,三合一 = 一个真正的「向量数据库」
 # ─────────────────────────────────────────────
-# 知识点 6 步流程在这里完整走完:
-#   Step 1:__init__ 确定 DIM
-#   Step 2:add_texts 外部已切好 chunk
-#   Step 3:add_texts 内部调 fake_embed 完成向量化
-#   Step 4:用 ToyVectorDB
-#   Step 5:build_index 选 flat/ivf 建索引
-#   Step 6:save_local / load_local 持久化,search 查询
+#
+# 知识点 6 步创建流程就在这里落地:
+#   Step 1  确定维度/模型                →  __init__(dim=48, embedding_model_name=...)
+#   Step 2  外部准备好切分 chunk          →  作为 add_texts 的入参传进来
+#   Step 3  chunk → 向量 + 写入           →  add_texts(内部调 fake_embed + 存进4个平行列表)
+#   Step 4  ToyVectorDB 本身就是数据库产品
+#   Step 5  选 Flat/IVF 建索引           →  build_index("flat" / "ivf")
+#   Step 6  存磁盘 / 读磁盘 / 查询        →  save_local / load_local / search
+#
+# 和真实产品的 API 对齐:
+#   ToyVectorDB.add_texts   ≈  Chroma.from_texts / FAISS index.add(xb)
+#   ToyVectorDB.build_index ≈  FAISS IndexIVFFlat.train(vectors)
+#   ToyVectorDB.search      ≈  db.similarity_search(query, k=3)
+#   ToyVectorDB.save_local  ≈  db.persist() / faiss.write_index()
+#   ToyVectorDB.load_local  ≈  Chroma(persist_dir=...) / faiss.read_index()
 
 class ToyVectorDB:
-    """真正的「向量数据库」:把数据存起来+索引加速+CRUD+持久化"""
+    """
+    【这是整个文件的主类】
+    内部其实就是 4 个平行的 Python 列表(数据层) + 一个索引对象(索引层):
+
+      self.row_ids  = [ "ch_001",   "ch_002",   ... ]  ← 每条记录的用户ID
+      self.vectors  = [ [0.1,...], [0.3,...], ... ]  ← 每条的向量(核心!)
+      self.texts    = [ "请假流程", "报销流程",  ... ]  ← 原始文本
+      self.metas    = [ {page:8},  {page:15},  ... ]  ← metadata(来源、页码等)
+      self.index    = FlatIndex() 或 IVFIndex()      ← 加速检索的索引
+    """
 
     def __init__(self, dim: int = DIM, embedding_model_name: str = "fake-embed-v1"):
         self.dim = dim
-        self.embedding_model_name = embedding_model_name  # ★ 记录模型名,防混用
+        # ★ 记录建库时用的模型名,以后加载时校验,防止「建库 bge,查询 MiniLM」
+        self.embedding_model_name = embedding_model_name
 
-        # Layer 1: 数据层
-        self.row_ids: list[str] = []          # 用户给的 id,对应行号
-        self.vectors: list[list[float]] = []  # (N, dim) 核心向量数组
+        # Layer 1 数据层:4 个平行数组,相同位置下标对应同一条记录(行号 row)
+        self.row_ids: list[str] = []
+        self.vectors: list[list[float]] = []
         self.texts: list[str] = []
         self.metas: list[dict] = []
 
-        # Layer 2: 索引层(一开始 None,调用 build_index 才建)
+        # Layer 2 索引层:一开始没建索引是 None,必须先调 build_index 才能 search
         self.index: FlatIndex | IVFIndex | None = None
         self.index_type: str = "none"
 
-    # ── Step 2 + Step 3:写入 chunk,内部同步做 Embedding ──
+    # ─────────────────── Step 2 + Step 3:批量添加 chunk ───────────────────
     def add_texts(self, id_text_meta: list[tuple[str, str, dict | None]]) -> None:
-        """批量添加:[(id, text, meta), ...]"""
-        start_row = len(self.vectors)
-        for row, (id_, text, meta) in enumerate(id_text_meta, start=start_row):
-            self.row_ids.append(id_)
-            vec = fake_embed(text)
-            self.vectors.append(vec)
-            self.texts.append(text)
-            self.metas.append(meta or {})
+        """
+        把 [(id, text, meta), (id, text, meta), ...] 一批 chunk 写进数据库。
+        同步做 Step 3:每条都调 fake_embed 转成向量。
 
-        # 索引如果已经建了,追加新向量也要进索引(我们简单起见:建一次就定了,
-        # 真实产品 FAISS/Milvus 支持 add 追加)
+        真场景等价:
+          texts = ["员工请假...", "报销制度..."]
+          ids   = ["ch_001", "ch_002"]
+          metas = [{page:8}, {page:15}]
+          # Chroma 会自动做 embedding:
+          db = Chroma.from_texts(texts=texts, ids=ids, metadatas=metas, embedding=emb)
+        """
+        # start_row:写之前有多少条,新的 chunk 就从这行号开始续
+        start_row = len(self.vectors)
+        # enumerate(..., start=start_row) 让 row 编号接在已有条目后面
+        for row, (id_, text, meta) in enumerate(id_text_meta, start=start_row):
+            self.row_ids.append(id_)                              # 写 id
+            vec = fake_embed(text)                                 # 做 Embedding
+            self.vectors.append(vec)                              # 写向量
+            self.texts.append(text)                               # 写原文本
+            self.metas.append(meta or {})                         # 写 metadata(空的话填 {})
+
+        # 如果索引已经建好了,追加的向量也得塞进去(真实 FAISS/Milvus 支持 add 追加)
         if self.index is not None:
             self.index.add(self.vectors[start_row:])
 
-    # ── Step 5:建索引(把「知识点 IVF / Flat」选一个) ──
+    # ─────────────────── Step 5:建索引 ───────────────────
     def build_index(self, index_type: str = "flat", **kwargs) -> None:
         """
-        index_type ∈ {flat, ivf}
-        ivf 的参数:nlist(桶数), nprobe(查询扫桶数)
+        选索引类型并构建。
+        index_type ∈ {"flat", "ivf"}
+        kwargs 接受:
+          ivf 用: nlist(桶数,默认16) / nprobe(查询扫桶数,默认4)
         """
         global _GLOBAL_VECTORS
-        _GLOBAL_VECTORS = self.vectors  # 给 IVF 索引查询时用
+        _GLOBAL_VECTORS = self.vectors   # 给 IVFIndex.search 用(避免传给索引对象的 copies)
 
         if index_type == "flat":
             idx = FlatIndex(self.dim)
@@ -379,53 +410,60 @@ class ToyVectorDB:
         self.index = idx
         self.index_type = index_type
 
-    # ── 查询:返回 Top-K 结构化结果 ──
+    # ─────────────────── 查询 Top-K ───────────────────
     def search(self, query: str, k: int = 3, query_vec: list[float] | None = None) -> list[dict]:
         """
-        传入 query 文本或直接传 query_vec(做索引对比时省 CPU)。
-        返回 [{"id","text","meta","score","row"}, ...]
+        查和 query 最像的前 k 条记录,返回结构化字典列表。
+        可以直接传 query 文本(内部自动 fake_embed),
+        也可以直接传 query_vec(省 CPU,做多次索引对比时复用同一个查询向量)。
         """
         if self.index is None:
             raise RuntimeError("还没建索引,请先调用 build_index('flat'/'ivf')")
 
         qv = query_vec if query_vec is not None else fake_embed(query)
-        rows, scores = self.index.search(qv, k)
+        rows, scores = self.index.search(qv, k)   # 索引给出行号和相似度
         out = []
+        # 根据行号,从 4 个平行列表里拼回完整信息
         for row, s in zip(rows, scores):
             out.append({
-                "row": row,
-                "id": self.row_ids[row],
+                "row":   row,
+                "id":    self.row_ids[row],
                 "score": s,
-                "text": self.texts[row],
-                "meta": self.metas[row],
+                "text":  self.texts[row],
+                "meta":  self.metas[row],
             })
         return out
 
-    # ── 持久化 save + load (对应知识点磁盘存储) ──
-    # 真实产品 Chroma/FAISS 会拆成几个文件,我们打包成 2 个文件方便看:
-    #   <dir>/db_meta.json  ← id/texts/metas + 头信息
-    #   <dir>/index.json    ← 索引的 vectors/centroids/buckets
-
+    # ─────────────────── Step 6:持久化(存磁盘) ───────────────────
+    # 磁盘文件布局(存两个 JSON,方便你直接打开看内部长啥样):
+    #   <dir>/db_meta.json  ← 数据层:dim / 模型名 / 4 个平行数组(含 vectors)
+    #   <dir>/index.json    ← 索引层:Flat 的 vectors,或 IVF 的 centroids+buckets
+    #
+    # 真实产品(Chroma 为例):
+    #   chroma_db/chroma.sqlite3     ← metadata + texts + id 映射
+    #   chroma_db/chroma-embeddings/<uuid>/data_level_0.bin ← 向量数组
+    #   chroma_db/chroma-embeddings/<uuid>/index.html      ← HNSW 图索引
     def save_local(self, directory: str) -> None:
-        os.makedirs(directory, exist_ok=True)
+        """把当前整个 DB(数据层 + 索引层) 序列化到磁盘目录 directory 下"""
+        os.makedirs(directory, exist_ok=True)  # 目录不存在就建
         meta_path = os.path.join(directory, "db_meta.json")
         index_path = os.path.join(directory, "index.json")
 
-        # 数据层
+        # ① 存数据层(4 个平行列表 + 头信息)
         db_meta = {
             "dim": self.dim,
             "embedding_model_name": self.embedding_model_name,
             "index_type": self.index_type,
             "n_rows": len(self.vectors),
             "row_ids": self.row_ids,
-            "vectors": self.vectors,    # ★ 数据层核心:把向量数组也放进 meta 文件
+            "vectors": self.vectors,
             "texts": self.texts,
             "metas": self.metas,
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(db_meta, f, ensure_ascii=False, indent=2)
 
-        # 索引层
+        # ② 存索引层(调 Flat/IVF 各自的 state_dict 方法)
         with open(index_path, "w", encoding="utf-8") as f:
             state = self.index.state_dict() if self.index else {"type": "none"}
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -434,40 +472,43 @@ class ToyVectorDB:
         print(f"   📄 {meta_path}  ({os.path.getsize(meta_path)//1024} KB)")
         print(f"   📄 {index_path} ({os.path.getsize(index_path)//1024} KB)")
 
+    # ─────────────────── Step 6:从磁盘重新加载 ───────────────────
     @classmethod
     def load_local(cls, directory: str, expected_embedding_model: str | None = None) -> "ToyVectorDB":
         """
-        从磁盘重新加载。
-        expected_embedding_model:如果传了,和库记录的模型名不一致会抛异常
-                                (知识点坑 1:建库和查询必须同模型!)
+        从 save_local 存的目录,读回一个全新的 ToyVectorDB 对象。
+
+        expected_embedding_model 是知识点里强调的「坑 1」:
+          如果传了,就和 DB 里记录的 embedding_model_name 对比,
+          不一致立即报错,避免「建库一个模型、查询另一个模型」把结果全搞乱。
         """
         meta_path = os.path.join(directory, "db_meta.json")
         index_path = os.path.join(directory, "index.json")
         with open(meta_path, "r", encoding="utf-8") as f:
             db_meta = json.load(f)
 
+        # ① 校验 embedding 模型名一致
         if expected_embedding_model and db_meta["embedding_model_name"] != expected_embedding_model:
             raise ValueError(
                 f"Embedding 模型不匹配!库是 {db_meta['embedding_model_name']}, "
                 f"你给的是 {expected_embedding_model},请删库重建。"
             )
 
+        # ② 新建对象,把数据层字段全填回去
         db = cls(db_meta["dim"], db_meta["embedding_model_name"])
         db.row_ids = db_meta["row_ids"]
-        db.vectors = db_meta["vectors"]   # ★ 从 db_meta 读,不再依赖索引文件
+        db.vectors = db_meta["vectors"]
         db.texts = db_meta["texts"]
         db.metas = db_meta["metas"]
         db.index_type = db_meta["index_type"]
 
-        # 索引层:根据 type 还原(只存 centroids/buckets,不重复存 vectors)
+        # ③ 重建索引层
         global _GLOBAL_VECTORS
         with open(index_path, "r", encoding="utf-8") as f:
             idx_state = json.load(f)
         if idx_state["type"] == "flat":
-            # Flat 索引的 state 里有 vectors(和 db.vectors 一样)
             db.index = FlatIndex.from_state(idx_state)
         elif idx_state["type"] == "ivf":
-            # IVF 索引只存 centroids + buckets,vectors 通过全局共享 db.vectors
             db.index = IVFIndex.from_state(idx_state)
         else:
             raise RuntimeError(f"load_local:未知索引类型 {idx_state['type']}")
@@ -477,8 +518,9 @@ class ToyVectorDB:
         print(f"   共 {len(db.vectors)} 条,维度 {db.dim},索引 {db.index_type}")
         return db
 
-    # ── inspect:看内部长啥样 ──
+    # ─────────────────── 调试工具:inspect() 打印内部快照 ───────────────────
     def inspect(self) -> None:
+        """打印 DB 内部概览:条数/维度/索引类型/前6条样例/IVF桶大小分布"""
         print("\n" + "=" * 70)
         print(f"🧮 ToyVectorDB 内部快照 | dim={self.dim} | N={len(self.vectors)} | "
               f"索引={self.index_type} | 模型={self.embedding_model_name}")
@@ -492,6 +534,7 @@ class ToyVectorDB:
             print(f"        text : {text_s}")
             print(f"        meta : {self.metas[i]}")
         if self.index_type == "ivf":
+            # 打印 IVF 桶大小分布,看 K-Means 分得均匀不
             assert isinstance(self.index, IVFIndex)
             lens = sorted([len(b) for b in self.index.buckets])
             print(f"\n   🪣 IVF 桶大小:min={min(lens)}, median={lens[len(lens)//2]},"
@@ -500,13 +543,78 @@ class ToyVectorDB:
 
 
 # ─────────────────────────────────────────────
-# 3. 造一批「模拟 chunk 数据」(100 条,多个主题混合)
+# 2.5 最小完整例子:3 条 chunk 从头跑一遍(没数据量,不被 demo_full 刷屏)
+# ─────────────────────────────────────────────
+# 命令行跑:python 示例.py mini   (只跑这个最小例子)
+
+MINI_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_vector_db_mini")
+
+def demo_mini_walkthrough():
+    """
+    对应知识点创建 6 步,每一步都有打印,3 条数据一眼能看全。
+    这是你第一次看这个文件的入口。
+    """
+    print("\n" + "#" * 70)
+    print("# 🟢 最小例子:从零建一个「只有 3 条记录」的向量数据库")
+    print("#" * 70)
+
+    # Step 1:确定维度/模型
+    print("\nStep 1 ✅ 确定模型:DIM=48, Embedding 模型名 = fake-embed-v1")
+    db = ToyVectorDB(dim=DIM, embedding_model_name="fake-embed-v1")
+
+    # Step 2:准备 3 条已经切好的 chunk(id, text, meta)
+    chunks = [
+        ("id_001", "员工请假需提前 3 天 OA 申请,部门主管审批生效",
+                  {"source": "员工手册.pdf", "page": 8,  "tag": "请假"}),
+        ("id_002", "报销需上传发票,月底前提交,财务 10 个工作日打款",
+                  {"source": "员工手册.pdf", "page": 15, "tag": "报销"}),
+        ("id_003", "出差一线城市住宿不超过 500 元一晚,高铁二等座",
+                  {"source": "员工手册.pdf", "page": 22, "tag": "出差"}),
+    ]
+    print(f"\nStep 2 ✅ 准备好 {len(chunks)} 条 chunk:")
+    for id_, text, meta in chunks:
+        print(f"         {id_} / tag={meta['tag']} / {text[:28]}…")
+
+    # Step 3:向量化 + 写入
+    print("\nStep 3 ✅ 把 chunks 写进 DB(内部自动 fake_embed 转向量)")
+    db.add_texts(chunks)
+    db.inspect()  # 打印内部快照,看看 4 个平行数组长啥样
+
+    # Step 4:ToyVectorDB 本身就是数据库
+    # Step 5:选 Flat 建索引(3 条用 Flat 就行,100% 召回)
+    print("\nStep 5 ✅ 建索引:选 Flat(暴力,因为只有 3 条没必要聚类)")
+    db.build_index("flat")
+
+    # Step 6a:存到磁盘
+    print("\nStep 6a ✅ save_local:持久化到磁盘")
+    db.save_local(MINI_SAVE_DIR)
+
+    # Step 6b:模拟关进程 + 重新加载
+    print("\nStep 6b ✅ del db → load_local:模拟「第二天重启程序,数据库还在」")
+    del db
+    db2 = ToyVectorDB.load_local(MINI_SAVE_DIR, expected_embedding_model="fake-embed-v1")
+
+    # Step 6c:查询
+    print("\nStep 6c ✅ 查 2 个问题,验证语义检索")
+    for q in ["怎么请假?", "报销怎么弄?"]:
+        print(f"\n💬 查询: {q}")
+        for r in db2.search(q, k=2):
+            print(f"   score={r['score']:.4f}  tag={r['meta']['tag']:<3}  "
+                  f"id={r['id']}")
+            print(f"         原文: {r['text']}")
+    print("\n🎉 全流程 6 步完成:准备 → 写 → 建索引 → 存 → 载 → 查")
+
+
+# ─────────────────────────────────────────────
+# 3. 造一批「模拟 chunk 数据」(120 条,6 个主题混合)
 # ─────────────────────────────────────────────
 
 def build_mock_chunks(n_per_topic: int = 20) -> list[tuple[str, str, dict]]:
     """
-    6 个主题,每个主题 n_per_topic 条,共 6*20=120 条,
-    用于测试 IVF 是否能按「主题聚桶」和查询召回率。
+    生成 mock 数据:
+      6 个主题(请假/报销/出差/会议室/薪酬/打卡),每个主题 n_per_topic 条,
+      用 {n} 插不同数字让每条不重复但语义高度相近,
+      用于演示 IVF 的 K-Means 能自动按主题聚桶。
     """
     topics = [
         ("LEAVE",  "请假制度", "员工手册.pdf",     "年假全年 10 天,病假凭医院证明销假,需提前 {n} 天在 OA 提交请假申请,经部门主管审批后生效。"),
@@ -531,8 +639,14 @@ def build_mock_chunks(n_per_topic: int = 20) -> list[tuple[str, str, dict]]:
 
 
 # ─────────────────────────────────────────────
-# 4. 主流程:演示创建→建索引→save→load→查询 全流程
+# 4. Demo 函数集合:不同规模的演示
 # ─────────────────────────────────────────────
+# 命令行参数选择运行哪个:
+#   python 示例.py mini    → 只跑 demo_mini_walkthrough (3 条,推荐第一次看)
+#   python 示例.py full    → 只跑 demo_full_workflow  (120 条 + IVF)
+#   python 示例.py cmp     → 只跑 demo_compare_flat_vs_ivf (Flat vs IVF 召回率对比)
+#   python 示例.py disk    → 只跑 show_disk_files (看持久化文件内容)
+#   python 示例.py all     → 全部跑一遍(默认)
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_vector_db")
 
@@ -592,7 +706,18 @@ def demo_full_workflow():
 
 
 def demo_compare_flat_vs_ivf():
-    """演示两种索引的召回差异:Flat 100%,IVF 近似"""
+    """
+    两种索引召回率对比:
+      Flat(暴力)= 100% 召回(标准答案)
+      IVF(K-Means聚类)= 近似召回,看能把 Flat 的结果覆盖到多少
+
+    做的事情:150 条数据,拿 20 条随机文本(本身就在库里)做查询。
+      指标 1:Top-1 命中—— IVF 返回的第 1 条是不是就是 Flat 返回的第 1 条(完全一致)?
+      指标 2:Top-3-in-Top-5 召回—— Flat 前 3 条,是不是都在 IVF 返回的前 5 条里?
+
+    想自己实验:把 build_index("ivf", nlist=6, nprobe=1) 的 nprobe 调大到 4,
+    再跑一遍 cmp,看两个指标是不是显著提升。这就是 IVF 的「速度 ↔ 召回率」旋钮。
+    """
     print("\n" + "#" * 70)
     print("# ⚖️  对比:Flat 索引(暴力 100% 召回) vs IVF 索引(近似加速)")
     print("#" * 70)
@@ -633,7 +758,13 @@ def demo_compare_flat_vs_ivf():
 
 
 def show_disk_files():
-    """把持久化的磁盘文件打开给你看一眼"""
+    """
+    把 save_local 写出去的两个 JSON 文件的前 500 字节打印出来预览。
+    知识点 Layer 1(数据层 + 索引层) 的磁盘布局:
+        db_meta.json → 数据层:头信息(dim/模型名) + row_ids / vectors / texts / metas
+        index.json   → 索引层:Flat 的 vectors,或 IVF 的 centroids / buckets
+    你可以直接用编辑器打开这两个文件,真的就是 JSON,能看懂。
+    """
     print("\n" + "#" * 70)
     print("# 💾 看看 save_local 写出去的文件长啥样(知识点 Layer 1)")
     print("#" * 70)
@@ -650,6 +781,25 @@ def show_disk_files():
 
 
 if __name__ == "__main__":
-    demo_full_workflow()
-    demo_compare_flat_vs_ivf()
-    show_disk_files()
+    import sys
+    arg = sys.argv[1] if len(sys.argv) > 1 else "all"
+    # 清空旧的持久化目录(避免之前 mini/full 互相污染)
+    for d in [SAVE_DIR, MINI_SAVE_DIR]:
+        try:
+            import shutil
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+        except Exception:
+            pass
+
+    if arg in ("all", "mini"):
+        demo_mini_walkthrough()
+    if arg in ("all", "full"):
+        demo_full_workflow()
+    if arg in ("all", "cmp"):
+        demo_compare_flat_vs_ivf()
+    if arg in ("all", "disk"):
+        # show_disk_files 依赖 demo_full_workflow 先跑(它写 my_vector_db)
+        if not os.path.isdir(SAVE_DIR):
+            demo_full_workflow()
+        show_disk_files()
