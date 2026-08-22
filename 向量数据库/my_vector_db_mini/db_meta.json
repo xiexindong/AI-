@@ -1,13 +1,19 @@
 {
+  "_comment_dim": "↓ 向量维度:每条文本被翻译成多少个浮点数(这里是 48)。建库时 ToyVectorDB(dim=48) 决定,所有向量长度必须等于这个值,否则维度不匹配会报错",
   "dim": 48,
+  "_comment_emb": "↓ 建库时用的 Embedding 模型名。load_local 时会拿这个和传入的 expected_embedding_model 对比,不一致直接报错 → 防止「建库 bge 查询 MiniLM」把结果搞乱",
   "embedding_model_name": "fake-embed-v1",
+  "_comment_idx": "↓ 索引类型:flat(暴力比对,慢但 100% 召回) / ivf(K-Means 聚类加速,快但会漏几个) / none(还没建索引)。决定 index.json 里存什么结构",
   "index_type": "flat",
+  "_comment_nrows": "↓ 库里现在有多少条记录。等于 row_ids / vectors / texts / metas 四个列表的长度,加载时做防御性校验",
   "n_rows": 3,
+  "_comment_rowids": "↓ 每条记录的用户外部 ID。和下面 vectors/texts/metas 三个列表是平行数组,位置一一对应:row_ids[0] 对应 vectors[0] / texts[0] / metas[0]",
   "row_ids": [
     "id_001",
     "id_002",
     "id_003"
   ],
+  "_comment_vectors": "↓ 整个向量库的核心数据:N×D 的浮点数大数组,每行 48 个数代表一条记录的语义指纹。真实产品(FAISS/Chroma)会存成 float32 二进制省 4 倍空间,这里用 JSON 是为了你能直接打开看",
   "vectors": [
     [
       -0.041178412770092376,
@@ -160,11 +166,13 @@
       0.004558567019978862
     ]
   ],
+  "_comment_texts": "↓ 每条记录的原始文本(查询返回时给 LLM 或用户看)。和 row_ids/vectors 同位置一一对应:texts[0] 就是 row_ids[0]=id_001 对应的文本",
   "texts": [
     "员工请假需提前 3 天 OA 申请,部门主管审批生效",
     "报销需上传发票,月底前提交,财务 10 个工作日打款",
     "出差一线城市住宿不超过 500 元一晚,高铁二等座"
   ],
+  "_comment_metas": "↓ 每条记录的元信息(来源/页码/主题)。搜索结果会一起返回,方便追溯「这段是从哪个 PDF 哪一页来的」。和 row_ids 同位置一一对应",
   "metas": [
     {
       "source": "员工手册.pdf",

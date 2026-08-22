@@ -1,5 +1,7 @@
 {
+  "_comment_type": "↓ 索引类型:flat=暴力比对(100%召回,慢) / ivf=K-Means聚类加速(近似召回,快)",
   "type": "flat",
+  "_comment_dim": "↓ 向量维度:每条记录转成多少个浮点数。和 db_meta.json 里的 dim 必须一致",
   "dim": 48,
   "vectors": [
     [
