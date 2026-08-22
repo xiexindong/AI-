@@ -26,27 +26,147 @@ _CHAR_CACHE: dict[tuple, list[float]] = {}
 
 def fake_embed(text: str, seed: int) -> list[float]:
     """
-    手搓版 Embedding。
-    参数 seed 代表「这是哪个模型」,seed 相同 = 同一个模型。
-    真场景:vec = SentenceTransformer('bge-small').encode(text)
+    【这段代码是干什么的】⭐
+    把一段「文字」翻译成一串「数字」(向量),让计算机能用数学方法比意思相近度。
+    这就是 Embedding 模型在做的事情,只不过这里是手搓简化版。
+
+    通俗类比:
+        文字 "猫咪"  → [0.8, -0.2, 0.5, 0.1, ...]  这串数字就是"猫咪"的语义指纹
+        文字 "小猫"  → [0.79, -0.21, 0.52, 0.12, ...] 数字很像 → 意思相近
+        文字 "汽车"  → [-0.3, 0.9, 0.1, -0.5, ...]   数字差很远 → 意思无关
+
+    核心思路(3 步):
+        ① 给每个字符(猫/狗/汽/车...)提前随机生成一串"它的数字指纹"
+           —— 同一个字符 + 同一个 seed → 永远生成同一串数字(可复现)
+        ② 一段话的向量 = 把话里每个字符的指纹"对应位置相加"
+           —— 字越多,累加方向越偏向那些字
+        ③ L2 归一化:把向量长度拉到 1
+           —— 这样后续算相似度时,不受字数多少影响,只看"方向"
+
+    参数:
+        text: 要翻译的文字
+        seed: 模型种子。seed 相同 = 同一个"模型",同一个字符→同一串指纹
+              seed 不同 = 不同模型,同一字符→不同指纹(空间都换了)
+
+    真场景对应:
+        真实 Embedding 模型(bge / MiniLM)是神经网络,本质上也是做这件事:
+        输入文本 → 输出定长向量 → 向量方向编码语义
+        只是神经网络学到了"真正"的语义,我们这里用字符哈希冒充一下。
     """
+    # ① 准备一个全 0 的累加器:长度 = DIM(48),每个位置都从 0 开始
+    # JS 类比: const vec = new Array(DIM).fill(0);
     vec = [0.0] * DIM
+
+    # ② 遍历文本里每个字符,把"这个字符的指纹"累加到 vec 上
     for ch in text:
+        # 用 (seed, ch) 当 key 去缓存里查:这个字符在这个模型下的指纹算过没
         key = (seed, ch)
+
         if key not in _CHAR_CACHE:
+            # 没算过 → 第一次见到这个字符,给它生成一串随机指纹并缓存
+            # 关键:用 (seed, 字符的 unicode) 做随机种子
+            #   - 同一个字符 + 同一个 seed → 同一串指纹(每次跑都一样)
+            #   - 换 seed → 指纹全变(等于换了个"模型")
+            # random.Random(seed) = JS 里的 new Random(seed),可复现的伪随机
             rng = random.Random(hash((seed, ord(ch))) & 0xFFFFFFFF)
+
+            # 生成 DIM 个 -1.0 ~ 1.0 之间的随机数,作为这个字符的"指纹"
+            # JS 类比: _CHAR_CACHE[key] = Array.from({length: DIM}, () => rng.uniform(-1, 1));
             _CHAR_CACHE[key] = [rng.uniform(-1.0, 1.0) for _ in range(DIM)]
+
+        # 取出这个字符的指纹(48 维的列表)
         cv = _CHAR_CACHE[key]
+
+        # 把指纹按位加到累加器 vec 上
+        # 例如:vec[i] 累加 cv[i],字符越多,vec 各维度的值越大
+        # JS 类比: for (let i = 0; i < DIM; i++) vec[i] += cv[i];
         for i in range(DIM):
             vec[i] += cv[i]
-    # L2 归一化
+
+    # ③ L2 归一化:让向量长度变成 1,只保留"方向"信息
+    # 原因:不归一化的话,字多的文本天然模长大,相似度会偏
+    # 归一化后,两个向量点积 = 夹角余弦,只看"方向像不像"
+    #
+    # 公式:每个分量除以向量的模长 |v| = √(v0² + v1² + ... + vD-1²)
+    # JS 类比:
+    #   const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1e-9;
+    #   return vec.map(v => v / norm);
     norm = math.sqrt(sum(v * v for v in vec)) or 1e-9
     return [v / norm for v in vec]
 
 
 def cosine(a: list[float], b: list[float]) -> float:
-    """因为都归一化过,直接点积就是余弦相似度"""
+    """
+    【这段代码是干什么的】⭐
+    算两个向量"有多像":返回值范围 -1.0 ~ +1.0
+        +1.0  方向完全一致 → 语义完全相同
+         0    方向垂直 → 语义无关
+        -1.0  方向相反 → 语义相反
+
+    【为什么这么简单】
+    正常余弦公式是:cos = (a·b) / (|a| * |b|)
+    但因为 fake_embed 最后做了 L2 归一化,|a|=|b|=1,所以分母是 1,
+    余弦相似度 = 直接点积 = Σ(a[i] * b[i])
+
+    【举例】
+    a = [1, 0]   b = [1, 0]   → 点积 = 1*1 + 0*0 = 1.0  (完全一样)
+    a = [1, 0]   b = [0, 1]   → 点积 = 1*0 + 0*1 = 0.0  (完全无关)
+    a = [1, 0]   b = [-1, 0]  → 点积 = -1.0             (完全相反)
+    """
+    # zip(a, b) 把两个列表"配对":[(a0,b0), (a1,b1), ...]
+    # sum(ai * bi for ai, bi in zip(a, b)) = 点积 Σ(a[i]*b[i])
+    # round(..., 4) 保留 4 位小数,打印好看一点
+    #
+    # JS 类比:
+    #   function cosine(a, b) {
+    #     let s = 0;
+    #     for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+    #     return Math.round(s * 10000) / 10000;
+    #   }
     return round(sum(ai * bi for ai, bi in zip(a, b)), 4)
+
+
+# ─────────────────────────────────────────────
+# 1.5 单独跑个小例子:让你看清 fake_embed + cosine 到底在干什么
+# ─────────────────────────────────────────────
+# 直接 `python 示例.py demo_embed` 就只跑这个例子,不被后面的 3 个 demo 刷屏
+# ---------------------------------------------------------------------
+
+def demo_embed_walkthrough():
+    """
+    一个最小例子:把 3 个词"猫咪/小猫/汽车"都变成向量,
+    然后看它们两两的相似度,直观感受 Embedding 在做什么。
+    """
+    print("\n" + "=" * 70)
+    print("🎯 最小例子:fake_embed + cosine 在干什么")
+    print("=" * 70)
+
+    SEED = 42   # 选一个"模型"
+
+    # ① 拿 3 个词去 Embedding
+    v_cat   = fake_embed("猫咪", SEED)
+    v_kitty = fake_embed("小猫", SEED)
+    v_car   = fake_embed("汽车", SEED)
+
+    # ② 看看每个词的向量长啥样(只打印前 8 维,48 维太长)
+    print("\n[1] 文本 → 向量(只看前 8 维):")
+    print(f"    「猫咪」 → {[round(v, 3) for v in v_cat[:8]]} … (共 {len(v_cat)} 维)")
+    print(f"    「小猫」 → {[round(v, 3) for v in v_kitty[:8]]} … (共 {len(v_kitty)} 维)")
+    print(f"    「汽车」 → {[round(v, 3) for v in v_car[:8]]} … (共 {len(v_car)} 维)")
+
+    # ③ 两两算余弦相似度
+    print("\n[2] 两两相似度(cosine):")
+    print(f"    cos(「猫咪」, 「小猫」) = {cosine(v_cat, v_kitty):+.4f}   ← 语义近,数值高")
+    print(f"    cos(「猫咪」, 「汽车」) = {cosine(v_cat, v_car):+.4f}   ← 语义远,数值低")
+    print(f"    cos(「小猫」, 「汽车」) = {cosine(v_kitty, v_car):+.4f}   ← 语义远,数值低")
+
+    # ④ 解释:为什么"猫咪 ↔ 小猫"分高?
+    print("\n[3] 为什么「猫咪 ↔ 小猫」得分会高?")
+    print("    因为两个词都含「猫」字,而「猫」字在我们这套手搓模型里")
+    print("    生成了一串固定的指纹,两次累加都把这段指纹加进去了 → 方向接近。")
+    print("    而「汽车」完全不含「猫」字,累加的是不同指纹 → 方向差远。")
+    print("\n    👉 这就是 Embedding 的本质:")
+    print("       让「意思像的内容」→「向量方向像」→「余弦相似度高」。")
 
 
 # ─────────────────────────────────────────────
@@ -207,6 +327,17 @@ def demo_3_embedding_with_vectordb():
 
 
 if __name__ == "__main__":
-    demo_1_same_model_similarity()
-    demo_2_different_model_space()
-    demo_3_embedding_with_vectordb()
+    import sys
+    # 用法:
+    #   python 示例.py             → 跑全部 4 个 demo
+    #   python 示例.py demo_embed  → 只跑最小例子,看 fake_embed + cosine 干啥
+    arg = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    if arg in ("all", "demo_embed"):
+        demo_embed_walkthrough()
+    if arg in ("all", "demo_1"):
+        demo_1_same_model_similarity()
+    if arg in ("all", "demo_2"):
+        demo_2_different_model_space()
+    if arg in ("all", "demo_3"):
+        demo_3_embedding_with_vectordb()
