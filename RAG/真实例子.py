@@ -55,41 +55,42 @@ _CHAR_VEC_CACHE: dict[str, list[float]] = {}
 
 def _char_vec(feat: str) -> list[float]:
     """一个特征(单字或双字)→ 一个固定向量(用特征自己做随机种子,保证结果稳定)"""
-    if feat in _CHAR_VEC_CACHE:
-        return _CHAR_VEC_CACHE[feat]
+    if feat in _CHAR_VEC_CACHE:          # 例: 之前算过 '报' → 命中缓存
+        return _CHAR_VEC_CACHE[feat]     # 直接返回缓存里的向量(跳过下面所有重算)
     # 用 FNV-1a 算法自算稳定哈希(不能用 Python 内置 hash():
     # 它对字符串每次运行随机变化,会导致每次运行检索结果不一样)
-    h = 2166136261
-    for b in feat.encode("utf-8"):
-        h ^= b  # 等价于: h = (h ^ b) & 0xFFFFFFFF
-        h = (h * 16777619) & 0xFFFFFFFF
-    rng = random.Random(h)
-    vec = [rng.uniform(-1.0, 1.0) for _ in range(VEC_DIM)]
-    _CHAR_VEC_CACHE[feat] = vec
+    h = 2166136261                       # 初始哈希值(固定常数,FNV 偏移基数)
+    for b in feat.encode("utf-8"):       # 例: '报' 编码成 2 个字节,逐个参与哈希
+        h ^= b  # 等价于: h = (h ^ b) & 0xFFFFFFFF   # 字节值与哈希异或
+        h = (h * 16777619) & 0xFFFFFFFF               # 乘质数并截断到 32 位
+    rng = random.Random(h)               # 用哈希做随机种子 → 同一特征每次随机序列完全一致
+    vec = [rng.uniform(-1.0, 1.0) for _ in range(VEC_DIM)]  # 例: '报' → 64 个 [-1,1] 的随机数,前 6 个 ≈ [-0.2, 0.461, -0.585, 0.152, -0.897, 0.586]
+    _CHAR_VEC_CACHE[feat] = vec          # 结果存进缓存,下次直接命中
     return vec
 
 
 def _text_features(text: str) -> list[str]:
     """把文本拆成特征列表:所有单字 + 所有相邻双字"""
-    features = [ch for ch in text if ch.strip()]
-    features += [text[i:i+2] for i in range(len(text) - 1) if text[i:i+2].strip()]
-    return features
+    features = [ch for ch in text if ch.strip()]     # ① 单字: "差旅报销" → ['差','旅','报','销']
+    features += [text[i:i+2] for i in range(len(text) - 1) if text[i:i+2].strip()]  # ② 相邻双字: → ['差旅','旅报','报销']
+    return features        # → 最终 = ['差','旅','报','销','差旅','旅报','报销'](7 个特征)
 
 
 def embed(text: str) -> list[float]:
     """text → 向量。真实写法:sentence_transformers.encode(text)"""
-    vec = [0.0] * VEC_DIM
-    for feat in _text_features(text): # ['差','旅','报','销','差旅','旅报','报销']
-        fv = _char_vec(feat) #
+    vec = [0.0] * VEC_DIM                     # ① 64 个 0 的全零向量,准备累加
+    for feat in _text_features(text): # ['差','旅','报','销','差旅','旅报','报销'] = 7 个特征
+        fv = _char_vec(feat)                  # 每个特征取自己的 64 维向量
         for i in range(VEC_DIM):
-            vec[i] += fv[i]
-    norm = math.sqrt(sum(v * v for v in vec)) or 1e-9
-    return [v / norm for v in vec]
+            vec[i] += fv[i]                   # ② 64 维逐位累加 → vec = 7 个特征向量之和
+    norm = math.sqrt(sum(v * v for v in vec)) or 1e-9  # ③ 模长(空文本=0 时用 1e-9 兜底,防除零)
+    return [v / norm for v in vec]            # ④ 每个分量除以模长 → 归一化(方向不变,长度=1)
 
 
 def cosine(a: list[float], b: list[float]) -> float:
     """余弦相似度(向量已归一化,直接点积即可)"""
-    return sum(x * y for x, y in zip[tuple[float, float]](a, b))
+    # 两个归一化向量做点积:对应分量相乘再求和(向量已归一化,|a|·|b|=1,所以 cos=a·b)
+    return sum(x * y for x, y in zip(a, b))
 
 
 # ═════════════════════════════════════════════════════════
@@ -144,14 +145,14 @@ def load_and_split() -> list[dict[str, Any]]:
             ],
         },
     ]
-    result = []
-    for doc in documents:
-        for i, text in enumerate(doc["chunks"]):
+    result = []                                  # 结果列表,初始为空
+    for doc in documents:                        # 遍历 5 份文档(员工手册/报销制度/出差规定/入职指南/公积金说明)
+        for i, text in enumerate(doc["chunks"]): # i = 该文档内的 chunk 序号(0,1,2…)
             result.append({
-                "text": text,
-                "meta": {"source": doc["source"], "chunk": i},
+                "text": text,                    # 正文
+                "meta": {"source": doc["source"], "chunk": i},  # 来源文档 + 序号
             })
-    return result
+    return result   # → 14 个 chunk:员工手册4 + 报销制度3 + 出差规定3 + 入职指南2 + 公积金说明2
 
 
 # ═════════════════════════════════════════════════════════
@@ -170,25 +171,28 @@ class MockLLM:
                   "一", "个", "我", "他", "请", "问", "下", "呀", "呢"}
 
     def answer(self, prompt: str, question: str, hits: list[dict[str, Any]]) -> str:
-        if not hits:
-            return "知识库中未找到相关内容,请咨询 HR 或查阅公司文档。"
+        if not hits:                              # 检索结果为空(知识库没找到任何相关)
+            return "知识库中未找到相关内容,请咨询 HR 或查阅公司文档。"  # → 直接认不知道,不硬编
 
         # 提取问题里的「关键词」(双字词组,去掉停用词)
         q_keywords = [f for f in _text_features(question)
                       if len(f) >= 2 and f not in self._STOPWORDS]
+        # 例: "出差住宿一晚能报多少钱?" 拆出 23 个特征 → 滤掉停用词(能/多少/一)和单字
+        #   → ['出差','差住','住宿','宿一','一晚','晚能','能报','报多','少钱','钱?'] 共 10 个
 
         # 模拟 LLM 逐条「阅读」检索到的材料:找到覆盖了关键词最多的那条
-        best, best_hit = 0, None
-        for h in hits:
-            hit_words = set(_text_features(h["text"]))
-            overlap = sum(1 for w in q_keywords if w in hit_words)
-            if overlap > best:
+        best, best_hit = 0, None                  # best = 最高重合数, best_hit = 对应材料
+        for h in hits:                            # 逐条看检索到的材料
+            hit_words = set(_text_features(h["text"]))       # 材料也拆成特征集合
+            overlap = sum(1 for w in q_keywords if w in hit_words)  # 与问题重合几个关键词
+            if overlap > best:                    # 比之前的都多 → 暂时胜出
                 best, best_hit = overlap, h
+        # 例(第一个问题): Top-1 材料「出差住宿标准…」 overlap = 5 → best = 5
 
         # 材料与问题有 ≥2 个共同关键词 → 相关,可以回答
         if best >= 2 and best_hit is not None:
-            return f"根据《{best_hit['meta']['source']}》规定:{best_hit['text']}"
-        return "知识库中未找到相关内容,请咨询 HR 或查阅公司文档。"
+            return f"根据《{best_hit['meta']['source']}》规定:{best_hit['text']}"  # → 带出处的答案
+        return "知识库中未找到相关内容,请咨询 HR 或查阅公司文档。"  # overlap < 2 → 承认不知道
 
 
 # ═════════════════════════════════════════════════════════
@@ -205,46 +209,49 @@ class ToyRAG:
     # 真实 embedding 模型内部也做了类似的事:重要的低频词(报销/差旅/公积金)
     # 贡献更大,高频虚词(的/了/是)贡献更小。这里手动实现。
     def _embed(self, text: str) -> list[float]:
-        vec = [0.0] * VEC_DIM
+        vec = [0.0] * VEC_DIM                        # 全零向量,准备加权累加
         for feat in _text_features(text):
             # 见过该特征 → 用它的 IDF 权重;没见过(通常是查询里的生词)→ 给中高权重
-            w = self.idf.get(feat, 1.5)
-            fv = _char_vec(feat)
+            w = self.idf.get(feat, 1.5)              # 例: '报销' → 2.5404(权重高);'钱'(生词)→ 1.5
+            fv = _char_vec(feat)                     # 特征自己的 64 维向量
             for i in range(VEC_DIM):
-                vec[i] += fv[i] * w
+                vec[i] += fv[i] * w                  # 加权累加:关键词向量被放大,虚词被缩小
         norm = math.sqrt(sum(v * v for v in vec)) or 1e-9
-        return [v / norm for v in vec]
+        return [v / norm for v in vec]               # 归一化(与 embed() 相同,只是多了权重)
 
     # ---------- 建库(离线做一次) ----------
     def ingest(self, docs: list[dict[str, Any]]) -> None:
-        from collections import Counter
-        n = len(docs)
+        from collections import Counter              # 计数器:不存在的 key 自动从 0 开始
+        n = len(docs)                                # → n = 14(本库共 14 个 chunk)
         # ① 统计每个特征出现在多少个 chunk 里(文档频率)
-        df = Counter()
-        for d in docs:
-            for feat in set(_text_features(d["text"])):
-                df[feat] += 1
+        df = Counter()                               # 空计数器: {'词': 出现在几个 chunk}
+        for d in docs:                               # 遍历每个 chunk
+            for feat in set(_text_features(d["text"])):  # set 去重:同一 chunk 里重复出现只算 1 次
+                df[feat] += 1                        # 例: df['报销']=2(2 个 chunk 有), df['晚']=1
         # ② 算 IDF:出现越少 → 权重越高
         self.idf = {f: math.log(n / (1 + c)) + 1.0 for f, c in df.items()}
+        # 例(n=14): c=1 → log(14/2)+1 ≈ 2.95(只 1 个 chunk 有 → 权重最高)
+        #           c=2 → log(14/3)+1 ≈ 2.54;  c=14 → log(14/15)+1 ≈ 0.93(每个 chunk 都有 → 最低)
         # ③ 向量化 + 存储
         for d in docs:
-            self.chunks.append(d)
-            self.vectors.append(self._embed(d["text"]))
+            self.chunks.append(d)                    # 存原文(检索命中后展示给 LLM 用)
+            self.vectors.append(self._embed(d["text"]))  # 存 64 维加权向量(和 chunks 下标一一对应)
         print(f"📥 建库完成:共 {len(self.chunks)} 个 chunk,"
               f"来源 {len({c['meta']['source'] for c in self.chunks})} 份文档")
+        # 实际输出 → 📥 建库完成:共 14 个 chunk,来源 5 份文档
 
     # ---------- 检索(向量相似度 Top-K) ----------
     def retrieve(self, question: str, k: int = 3) -> list[dict[str, Any]]:
-        qv = self._embed(question)
-        scored: list[dict[str, Any]] = []
-        for i, vec in enumerate(self.vectors):
+        qv = self._embed(question)                   # 问题也向量化(用建库时同一套 IDF 权重)
+        scored: list[dict[str, Any]] = []            # 打分结果列表
+        for i, vec in enumerate(self.vectors):       # 遍历库里每个 chunk 的向量(共 14 个)
             scored.append({
-                "score": round(cosine(qv, vec), 4),
-                "text": self.chunks[i]["text"],
+                "score": round(cosine(qv, vec), 4),  # 问题向量和 chunk 向量的余弦相似度
+                "text": self.chunks[i]["text"],      # 例: "出差住宿…" vs 出差规定 → 0.289
                 "meta": self.chunks[i]["meta"],
             })
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:k]
+        scored.sort(key=lambda x: x["score"], reverse=True)  # 相似度从高到低排序
+        return scored[:k]                            # 取前 k 个(默认 3)返回
 
     # ---------- 问答完整闭环(4 步) ----------
     def ask(self, question: str, k: int = 3) -> str:
@@ -286,14 +293,14 @@ def main():
     print("=" * 64)
 
     # 建库:文档 → 切分 → 向量化(一次,之后新文档进来增量 ingest)
-    docs = load_and_split()
-    rag = ToyRAG(llm=MockLLM())
-    rag.ingest(docs)
+    docs = load_and_split()                 # → 14 个 chunk
+    rag = ToyRAG(llm=MockLLM())             # 建引擎(LLM 用规则模拟)
+    rag.ingest(docs)                        # → 📥 建库完成:共 14 个 chunk,来源 5 份文档
 
     # 连续问答:覆盖「语义召回」「同义词」「无答案」三种情况
-    rag.ask("出差住宿一晚能报多少钱?")     # → 命中 出差规定(500 元/晚)
-    rag.ask("打车费能报销吗?")             # → 语义命中 差旅报销(「打车费」≈「交通费」)
-    rag.ask("公积金怎么提取?")             # → 命中 公积金说明
+    rag.ask("出差住宿一晚能报多少钱?")     # → 命中 出差规定(500 元/晚),Top-1 score=0.289
+    rag.ask("打车费能报销吗?")             # → 语义命中 差旅报销(「打车费」≈「交通费」),Top-1 score=0.3448
+    rag.ask("公积金怎么提取?")             # → 命中 公积金说明,Top-1 score=0.5417
     rag.ask("年会抽奖的奖品都有什么?")     # → 知识库里没有 → 承认不知道(防幻觉)
 
 
