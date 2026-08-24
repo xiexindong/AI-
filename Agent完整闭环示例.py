@@ -147,7 +147,7 @@ class MiniLLM:
         # 规则 1:已有工具返回了实时数据 → 基于数据生成最终回答
         if history and history[-1]["type"] == "tool_result":
             return {"type": "answer", "content": self._answer_from_tool(history[-1])}
-
+            
         # 规则 2:已有检索结果(非空) → 基于文档回答
         if history and history[-1]["type"] == "search_result" and history[-1]["content"]:
             return {"type": "answer", "content": self._answer_from_docs(history[-1])}
