@@ -1,0 +1,22 @@
+{
+  "name": "table-page-generator",
+  "version": "2.1.0",
+  "author": "data-platform-team",
+  "type": "generator",
+  "entry": "SKILL.md",
+  "description": "配置驱动的后台表格页生成器:分页/筛选/排序/合计/批量操作",
+  "permissions": ["files:read", "files:write", "terminal:read"],
+  "runtime": {
+    "node": ">=18",
+    "framework": ["react>=18", "antd>=5"]
+  },
+  "parameters": {
+    "$ref": "schemas/column.schema.json"
+  },
+  "tags": ["table", "crud", "admin", "generator"],
+  "changelog": [
+    { "version": "2.1.0", "note": "新增 cascader 筛选类型" },
+    { "version": "2.0.0", "note": "流程拆分为 5 个子指令,支持脚手架生成" },
+    { "version": "1.0.0", "note": "初版:单文件 Skill" }
+  ]
+}

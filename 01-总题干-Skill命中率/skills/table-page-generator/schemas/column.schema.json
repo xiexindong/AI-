@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "column.schema.json",
+  "title": "PageConfig",
+  "description": "表格页生成器的配置契约。LLM 生成的配置必须通过本 schema 校验。",
+  "type": "object",
+  "required": ["title", "api", "columns"],
+  "additionalProperties": false,
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "api": { "type": "string", "pattern": "^/" },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/column" }
+    },
+    "extra": {
+      "type": "object",
+      "properties": {
+        "rowSelection": { "type": "boolean" },
+        "batchActions": { "type": "array", "items": { "type": "string" } },
+        "defaultSort": {
+          "type": "object",
+          "properties": {
+            "field": { "type": "string" },
+            "order": { "enum": ["asc", "desc"] }
+          }
+        },
+        "refetchOn": { "type": "array", "items": { "type": "string" } },
+        "tree": {
+          "type": "object",
+          "properties": { "childrenField": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "column": {
+      "type": "object",
+      "required": ["field", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "field": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+        "label": { "type": "string" },
+        "width": { "type": "number", "minimum": 40 },
+        "sortable": { "type": "boolean", "default": false },
+        "render": {
+          "type": "string",
+          "enum": ["text", "date", "money", "number", "tag", "link", "custom"]
+        },
+        "summary": { "enum": ["sum", "avg", "count"] },
+        "renderCustom": { "type": "string", "description": "custom 渲染时引用的组件路径" },
+        "filter": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["input", "select", "multiSelect", "dateRange", "cascader", "numberRange"]
+            },
+            "optionsApi": { "type": "string", "pattern": "^/" },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": { "label": { "type": "string" }, "value": {} }
+              }
+            }
+          },
+          "required": ["type"]
+        }
+      }
+    }
+  }
+}
